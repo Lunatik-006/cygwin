@@ -1,0 +1,83 @@
+name: dsh-msys-build
+
+# Manual build of the patched MSYS DLL only. Runtime boundary checks run on the
+# actual DSH host; this workflow does not claim that a Server runner supports PSEC.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  MSYS2_RUNTIME_REF: 710e5275eb86d54b45b5f4d71ecc4e1cac1b9302
+
+jobs:
+  build-msys-dll:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout patch source
+        uses: actions/checkout@v7
+
+      - name: MSYS2 build environment
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          update: true
+          install: >-
+            msys2-devel base-devel autotools cocom diffutils gcc
+            gettext-devel libiconv-devel make mingw-w64-cross-crt
+            mingw-w64-cross-gcc mingw-w64-cross-zlib perl zlib-devel
+            xmlto docbook-xsl libzstd-devel
+
+      - name: Checkout pinned MSYS2 runtime
+        uses: actions/checkout@v7
+        with:
+          repository: git-for-windows/msys2-runtime
+          ref: ${{ env.MSYS2_RUNTIME_REF }}
+          path: msys2-runtime
+
+      - name: Transfer canonical patch to MSYS2 runtime
+        shell: bash
+        run: tools/ci/apply-to-msys.sh msys2-runtime
+
+      - name: Verify the edited security helper reached the build tree
+        shell: pwsh
+        run: |
+          $source = [IO.File]::ReadAllText('winsup/cygwin/sec/helper.cc').Replace("`r`n", "`n")
+          $target = [IO.File]::ReadAllText('msys2-runtime/winsup/cygwin/sec/helper.cc').Replace("`r`n", "`n")
+          if ($source -cne $target) {
+            throw 'Canonical patch does not reproduce the checked-in security helper; regenerate tools/ci/cygwin-winsup.patch'
+          }
+
+      - name: Build msys-2.0.dll
+        shell: msys2 {0}
+        run: bash tools/ci/build-runtime-dll.sh msys2-runtime new-msys-2.0.dll
+
+      - name: Stage DLL, checksum, and source provenance
+        shell: pwsh
+        run: |
+          $built = @(Get-ChildItem -LiteralPath 'msys2-runtime/build' -Recurse -File -Filter 'new-msys-2.0.dll')
+          if ($built.Count -ne 1) { throw "Expected exactly one built MSYS DLL, found $($built.Count)" }
+          $output = Join-Path $env:GITHUB_WORKSPACE 'dsh-msys-artifact'
+          New-Item -ItemType Directory -Path $output -Force | Out-Null
+          $dll = Join-Path $output 'msys-2.0.dll'
+          Copy-Item -LiteralPath $built[0].FullName -Destination $dll
+          Copy-Item -LiteralPath 'tools/ci/cygwin-winsup.patch' -Destination (Join-Path $output 'source.patch')
+          $digest = (Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$digest *msys-2.0.dll" | Set-Content -LiteralPath (Join-Path $output 'SHA256SUMS') -Encoding ascii
+          [ordered]@{
+            sourceRepository = $env:GITHUB_REPOSITORY
+            sourceCommit = $env:GITHUB_SHA
+            sourceRef = $env:GITHUB_REF
+            msys2RuntimeCommit = $env:MSYS2_RUNTIME_REF
+            sourcePatchSha256 = (Get-FileHash -LiteralPath 'tools/ci/cygwin-winsup.patch' -Algorithm SHA256).Hash.ToLowerInvariant()
+            dllSha256 = $digest
+          } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $output 'provenance.json') -Encoding utf8
+          Get-Content -LiteralPath (Join-Path $output 'SHA256SUMS')
+
+      - name: Upload patched MSYS runtime
+        uses: actions/upload-artifact@v7
+        with:
+          name: dsh-msys-runtime
+          path: dsh-msys-artifact/
+          if-no-files-found: error
