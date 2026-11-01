@@ -546,19 +546,18 @@ set_cygwin_privileges (HANDLE token)
 
 /* Cached identities of a confined (sandboxed) process token.  Both are
    NO_SID for a normal, unrestricted token. */
-static cygsid confined_logon_sid (NO_SID);
+static cygsid confined_restricting_sid (NO_SID);
 static cygsid confined_appcontainer_sid (NO_SID);
 static NO_COPY bool confined_sids_queried = false;
 
 /* Query the current process token for the identities a sandbox backend
    presents when it opens a named object owned by the MSYS runtime:
 
-   - confined_logon_sid: the token's logon SID (SE_GROUP_LOGON_ID).  A
-     restricted token (CreateRestrictedToken, used by sandbox backends that
-     do not use an AppContainer) keeps the logon SID enabled even when the
-     user SID has been turned into a deny-only group, so it is the identity
-     such a confined client reliably presents.  See dsh-win-gitbash#10:
-     without it, MSYS's signal pipe self-connect fails with Win32 error 5.
+   - confined_restricting_sid: the private restricting capability already
+     granted full access in the parent's token default DACL.  Do not grant
+     the shared logon SID: sec_acl also supplies process/thread descriptors
+     and the token default DACL, so that would permit another confined
+     session to modify this process or duplicate its handles.
 
    - confined_appcontainer_sid: the AppContainer package SID
      (TokenAppContainerSid).  This is the SID Windows uses to scope
@@ -571,38 +570,19 @@ query_confined_sids ()
   NTSTATUS status;
   ULONG size;
   HANDLE token = NULL;
-  PTOKEN_GROUPS groups;
-  tmp_pathbuf tp;
+  tmp_pathbuf app_buf, restricted_buf, groups_buf, dacl_buf, user_buf;
 
   if (confined_sids_queried)
     return;
   confined_sids_queried = true;
+  confined_restricting_sid = NO_SID;
+  confined_appcontainer_sid = NO_SID;
 
   status = NtOpenProcessToken (NtCurrentProcess (), TOKEN_QUERY, &token);
   if (!NT_SUCCESS (status))
     {
-      debug_printf ("NtOpenProcessToken: %y", status);
-      return;
+      api_fatal ("Cannot query sandbox token identities: %y", status);
     }
-
-  /* Logon SID: always enabled, even in a restricted token where the user
-     SID is deny-only.  Guarded only by SE_GROUP_LOGON_ID and by not being
-     deny-only itself; TokenGroups is universally queryable. */
-  groups = (PTOKEN_GROUPS) tp.w_get ();
-  status = NtQueryInformationToken (token, TokenGroups, groups,
-				    2 * NT_MAX_PATH, &size);
-  if (NT_SUCCESS (status))
-    {
-      for (DWORD pg = 0; pg < groups->GroupCount; ++pg)
-	if ((groups->Groups[pg].Attributes & SE_GROUP_LOGON_ID)
-	    && !(groups->Groups[pg].Attributes & SE_GROUP_USE_FOR_DENY_ONLY))
-	  {
-	    confined_logon_sid = groups->Groups[pg].Sid;
-	    break;
-	  }
-    }
-  else
-    debug_printf ("NtQueryInformationToken(TokenGroups) %y", status);
 
   /* AppContainer package SID.  Deliberately NOT gated on the
      TokenIsAppContainer boolean: some sandboxes (MXC's ProcessContainer)
@@ -613,14 +593,89 @@ query_confined_sids ()
      inside the container (microsoft/mxc#1061, dsh-win-gitbash#10). */
   {
     PTOKEN_APPCONTAINER_INFORMATION pac =
-	(PTOKEN_APPCONTAINER_INFORMATION) tp.w_get ();
+	(PTOKEN_APPCONTAINER_INFORMATION) app_buf.w_get ();
 
     status = NtQueryInformationToken (token, TokenAppContainerSid, pac,
 				      2 * NT_MAX_PATH, &size);
     if (NT_SUCCESS (status) && pac->TokenAppContainer)
-      confined_appcontainer_sid = pac->TokenAppContainer;
+      {
+	confined_appcontainer_sid = pac->TokenAppContainer;
+	NtClose (token);
+	return;
+      }
   }
 
+  PTOKEN_GROUPS restricted = (PTOKEN_GROUPS) restricted_buf.w_get ();
+  status = NtQueryInformationToken (token, TokenRestrictedSids, restricted,
+				    2 * NT_MAX_PATH, &size);
+  if (!NT_SUCCESS (status))
+    api_fatal ("Cannot query sandbox restricting SIDs: %y", status);
+  if (restricted->GroupCount == 0)
+    {
+      NtClose (token);
+      return;
+    }
+
+  PTOKEN_GROUPS groups = (PTOKEN_GROUPS) groups_buf.w_get ();
+  status = NtQueryInformationToken (token, TokenGroups, groups,
+				    2 * NT_MAX_PATH, &size);
+  if (!NT_SUCCESS (status))
+    api_fatal ("Cannot query sandbox token groups: %y", status);
+  PTOKEN_USER user = (PTOKEN_USER) user_buf.w_get ();
+  status = NtQueryInformationToken (token, TokenUser, user,
+				    2 * NT_MAX_PATH, &size);
+  if (!NT_SUCCESS (status))
+    api_fatal ("Cannot query sandbox token user: %y", status);
+  PTOKEN_DEFAULT_DACL tdacl = (PTOKEN_DEFAULT_DACL) dacl_buf.w_get ();
+  status = NtQueryInformationToken (token, TokenDefaultDacl, tdacl,
+				    2 * NT_MAX_PATH, &size);
+  if (!NT_SUCCESS (status) || !tdacl->DefaultDacl)
+    api_fatal ("Cannot query sandbox token default DACL: %y", status);
+
+  bool world_granted = false;
+  for (DWORD i = 0; i < tdacl->DefaultDacl->AceCount; ++i)
+    {
+      PVOID raw;
+      status = RtlGetAce (tdacl->DefaultDacl, i, &raw);
+      if (!NT_SUCCESS (status))
+	api_fatal ("Cannot inspect sandbox token default DACL: %y", status);
+      PACCESS_ALLOWED_ACE ace = (PACCESS_ALLOWED_ACE) raw;
+      if (ace->Header.AceType != ACCESS_ALLOWED_ACE_TYPE
+	  || (!(ace->Mask & GENERIC_ALL)
+	      && (ace->Mask & FILE_ALL_ACCESS) != FILE_ALL_ACCESS))
+	continue;
+      PSID sid = (PSID) &ace->SidStart;
+      bool restricting = false;
+      for (DWORD j = 0; j < restricted->GroupCount; ++j)
+	if (RtlEqualSid (sid, restricted->Groups[j].Sid))
+	  {
+	    restricting = true;
+	    break;
+	  }
+      if (!restricting)
+	continue;
+      if (RtlEqualSid (sid, well_known_world_sid))
+	{
+	  world_granted = true;
+	  continue;
+	}
+      bool shared = RtlEqualSid (sid, user->User.Sid);
+      for (DWORD j = 0; !shared && j < groups->GroupCount; ++j)
+	shared = RtlEqualSid (sid, groups->Groups[j].Sid);
+      if (shared)
+	continue;
+      if (confined_restricting_sid != NO_SID
+	  && confined_restricting_sid != sid)
+	api_fatal ("Sandbox token default DACL grants multiple private capabilities");
+      confined_restricting_sid = sid;
+    }
+  /* A read-only restricted token may already grant World in its default
+     DACL for child IPC.  Preserve that existing authorization only when
+     no private capability is available; never substitute a logon grant. */
+  if (confined_restricting_sid == NO_SID && world_granted)
+    confined_restricting_sid = well_known_world_sid;
+  if (confined_restricting_sid == NO_SID)
+    api_fatal ("Sandbox token default DACL has no private restricting capability");
   NtClose (token);
 }
 
@@ -689,19 +744,14 @@ sec_acl (PACL acl, bool original, bool admins, PSID sid1, PSID sid2, DWORD acces
 				   well_known_system_sid);
   if (!NT_SUCCESS (status))
     debug_printf ("RtlAddAccessAllowedAce(system) %y", status);
-  /* A sandboxed process (MSYS2/Cygwin under the MXC ProcessContainer or a
-     restricted token) presents an identity the static DACL above does not
-     cover: an AppContainer client authenticates via its package SID, and a
-     restricted token may carry the user SID only as a deny-only group, so a
-     user/admin/System DACL denies the client's self-connect (e.g. MSYS's
-     signal pipe, "couldn't create signal pipe, Win32 error 5").  Grant the
-     AppContainer package SID when present; it is per-container, so nothing
-     outside the sandbox gains access.  Note the mandatory (integrity) label
-     on the object still applies, so a Medium-labelled object remains
-     unreachable from a Low-IL client -- only the DACL mismatch is fixed
-     here. */
+  /* Preserve the confined parent's IPC authority when the static
+     user/admin/System descriptor cannot satisfy the client's restricted
+     access check.  A private capability must remain private when this
+     descriptor becomes a process ACL or a child's token default DACL;
+     substituting the shared logon SID would permit cross-session process
+     modification.  Mandatory integrity labels still apply. */
   sec_acl_add_sid (acl, confined_appcontainer_sid, "appcontainer");
-  sec_acl_add_sid (acl, confined_logon_sid, "logon");
+  sec_acl_add_sid (acl, confined_restricting_sid, "restricting capability");
   status = RtlFirstFreeAce (acl, &pAce);
   if (NT_SUCCESS (status) && pAce)
     acl->AclSize = (char *) pAce - (char *) acl;
